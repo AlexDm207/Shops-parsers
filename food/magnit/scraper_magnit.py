@@ -187,7 +187,14 @@ class MagnitScraper:
         soup = BeautifulSoup(html, "html.parser")
         cards: list[Any] = []
         for link in soup.select("a[href*='/promo-product/']"):
-            card = link.find_parent(["article", "li", "div"])
+            card = None
+            for parent in link.parents:
+                text = self._clean(parent.get_text(" ", strip=True))
+                if len(text) > 1600:
+                    break
+                if re.search(r"\d[\d\s]*[,.]?\d*\s*(?:₽|руб\.?|р\.?)", text, flags=re.I):
+                    card = parent
+                    break
             if card is not None:
                 cards.append(card)
         products = [product for card in cards if (product := self._product_from_card(card, page_url))]
@@ -222,7 +229,11 @@ class MagnitScraper:
                 LOGGER.warning("Skipping Magnit category page %s: %s", page_url, error)
                 break
             page_products = self._parse_products(html, page_url)
+            before_count = len(products)
             products.extend(page_products)
+            products = self._unique(products)
+            if not page_products or len(products) == before_count:
+                break
             page_url = self._next_page(html, page_url, visited)
         return self._unique(products)
 

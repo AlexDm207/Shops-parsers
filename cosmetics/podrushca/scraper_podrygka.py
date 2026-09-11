@@ -42,13 +42,15 @@ except ImportError:
 
 try:
     import cloudscraper
-except ImportError:  # pragma: no cover - exercised only when the optional dependency is absent
+except ImportError:  # pragma: no cover
     cloudscraper = None
 
 import requests
 
 
 LOGGER = logging.getLogger(__name__)
+
+
 class PodrygkaScraper:
     """Collect raw product dictionaries from Podrygka catalogue pages."""
 
@@ -229,13 +231,13 @@ class PodrygkaScraper:
                 if product is not None:
                     yield product
 
-    def parse_products(self, html_or_json: str | bytes | Mapping[str, Any] | list[Any]) -> list[dict[str, Any]]:
-        """Parse product records from HTML or an API JSON payload.
-
-        Values are intentionally returned in their source form.  In particular,
-        this method does not strip currency symbols or convert decimal formats.
-        """
-        page_url = self.start_url
+    def parse_products(
+        self,
+        html_or_json: str | bytes | Mapping[str, Any] | list[Any],
+        page_url: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Parse product records from HTML or an API JSON payload."""
+        page_url = page_url or self.start_url
         if isinstance(html_or_json, (Mapping, list)):
             return list(self._products_from_json(html_or_json, page_url))
 
@@ -261,7 +263,8 @@ class PodrygkaScraper:
             except ScraperError as exc:
                 LOGGER.warning("%s", exc)
                 break
-            page_products = self.parse_products(body)
+            current_page_url = self._page_url(page)
+            page_products = self.parse_products(body, page_url=current_page_url)
             LOGGER.info("Parsed page %s: products=%s", page, len(page_products))
             if not page_products:
                 LOGGER.warning("No products found on page %s; stopping pagination", page)
@@ -283,7 +286,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     scraper = PodrygkaScraper(
         "https://www.podrygka.ru/catalog/?page=1",
-        max_pages=3,
+        max_pages=None,
     )
     products = scraper.run()
     scraper.save_to_jsonl("products.jsonl")
