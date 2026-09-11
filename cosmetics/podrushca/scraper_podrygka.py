@@ -9,13 +9,27 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
+import sys
 import time
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator, Mapping
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
+
+COMMON_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(COMMON_ROOT))
+from scraper_common import (  # noqa: E402
+    REQUEST_TIMEOUT_SECONDS,
+    ScraperError,
+    create_session,
+    publish_products,
+    raw_product,
+    save_jsonl,
+    sleep_between_requests,
+)
 
 try:
     import cloudscraper
@@ -26,12 +40,6 @@ import requests
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-
 class PodrygkaScraper:
     """Collect raw product dictionaries from Podrygka catalogue pages."""
 
@@ -40,7 +48,7 @@ class PodrygkaScraper:
         start_url: str,
         max_pages: int | None = None,
         *,
-        request_timeout: float = 30.0,
+        request_timeout: float = REQUEST_TIMEOUT_SECONDS,
         min_delay: float = 1.0,
         max_delay: float = 3.0,
         session: requests.Session | None = None,
@@ -57,25 +65,9 @@ class PodrygkaScraper:
         self.request_timeout = request_timeout
         self.min_delay = min_delay
         self.max_delay = max_delay
-        self.session = session or self._create_session()
+        self.session = session or create_session()
         self.products: list[dict[str, Any]] = []
         self._requested_pages = 0
-
-    @staticmethod
-    def _create_session() -> requests.Session:
-        """Create a browser-like session, preferring Cloudflare support."""
-        if cloudscraper is not None:
-            session = cloudscraper.create_scraper(browser="chrome")
-        else:
-            session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            }
-        )
-        return session
 
     def _page_url(self, page: int) -> str:
         parts = urlsplit(self.start_url)
@@ -94,7 +86,7 @@ class PodrygkaScraper:
             response.raise_for_status()
         except requests.RequestException as exc:
             LOGGER.exception("Request failed: %s", url)
-            raise RuntimeError(f"Unable to fetch Podrygka page: {url}") from exc
+            raise ScraperError(f"Unable to fetch Podrygka page: {url}") from exc
         self._requested_pages += 1
         LOGGER.info("Fetched page: status=%s bytes=%s", response.status_code, len(response.content))
         return response.text
@@ -112,6 +104,14 @@ class PodrygkaScraper:
             if data.get(key) is not None:
                 return data[key]
         return None
+
+    @staticmethod
+    def _product_url(value: Any, page_url: str) -> str | None:
+        if not value:
+            return None
+        product_url = urljoin(page_url, str(value).strip())
+        host = urlsplit(product_url).netloc.lower().split(":", 1)[0]
+        return product_url if host == "podrygka.ru" or host.endswith(".podrygka.ru") else None
 
     def _product_from_mapping(self, data: Mapping[str, Any], page_url: str) -> dict[str, Any] | None:
         name = self._first_value(data, "product_name", "name", "title", "productName")
@@ -132,14 +132,17 @@ class PodrygkaScraper:
             old = old if old is not None else self._first_value(offers, "highPrice", "oldPrice")
         if not name or not url or current is None:
             return None
-        return {
-            "product_name": str(name).strip(),
-            "product_url": urljoin(page_url, str(url).strip()),
-            "price_current": current,
-            "price_old": old,
-            "discount_label": discount,
-            "parsed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        }
+        product_url = self._product_url(url, page_url)
+        if not product_url:
+            return None
+        return raw_product(
+            shop="podruzhka",
+            url=product_url,
+            name=name,
+            current_price=current,
+            old_price=old,
+            discount=discount,
+        )
 
     def _products_from_json(self, value: Any, page_url: str) -> Iterator[dict[str, Any]]:
         if isinstance(value, Mapping):
@@ -246,7 +249,7 @@ class PodrygkaScraper:
         while self.max_pages is None or page <= self.max_pages:
             try:
                 body = self.fetch_page(page)
-            except RuntimeError as exc:
+            except ScraperError as exc:
                 LOGGER.warning("%s", exc)
                 break
             page_products = self.parse_products(body)
@@ -261,9 +264,7 @@ class PodrygkaScraper:
     def save_to_jsonl(self, filename: str = "products.jsonl") -> None:
         """Write collected raw records as UTF-8 JSON Lines."""
         LOGGER.info("Saving %s products to %s", len(self.products), filename)
-        with open(filename, "w", encoding="utf-8", newline="\n") as output:
-            for product in self.products:
-                output.write(json.dumps(product, ensure_ascii=False) + "\n")
+        save_jsonl(self.products, filename)
 
 
 if __name__ == "__main__":
@@ -272,5 +273,7 @@ if __name__ == "__main__":
         "https://www.podrygka.ru/catalog/?page=1",
         max_pages=3,
     )
-    scraper.run()
+    products = scraper.run()
     scraper.save_to_jsonl("products.jsonl")
+    if os.getenv("PUBLISH_TO_KAFKA", "false").lower() == "true":
+        publish_products("podruzhka", products)

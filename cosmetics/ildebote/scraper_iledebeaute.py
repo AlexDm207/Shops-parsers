@@ -1,232 +1,192 @@
+"""Synchronous Il de Beaute raw-product scraper."""
+
+from __future__ import annotations
+
 import json
+import logging
+import os
 import re
+import sys
+from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-import cloudscraper
 from bs4 import BeautifulSoup
 
+COMMON_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(COMMON_ROOT))
+from scraper_common import (  # noqa: E402
+    REQUEST_TIMEOUT_SECONDS,
+    ScraperError,
+    create_session,
+    publish_products,
+    raw_product,
+    save_jsonl,
+)
 
+LOGGER = logging.getLogger(__name__)
 BASE_URL = "https://iledebeaute.ru"
-CATALOG_URL = "https://iledebeaute.ru/catalog/tip-has_discount-iz-prom/"
-OUTPUT_PATH = "products.jsonl"
-HEADERS = {
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Referer": f"{BASE_URL}/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-}
+DEFAULT_CATALOG_URL = f"{BASE_URL}/catalog/tip-has_discount-iz-prom/"
 
 
-def clean_text(value):
-    """Убирает лишние пробелы, чтобы текст из HTML был удобен для записи."""
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).replace("\xa0", " ").strip()
+def clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).replace("\xa0", " ").strip()
 
 
-def normalize_name(value):
-    """Удаляет технический префикс сайта из названия товара."""
-    name = clean_text(value)
-    return re.sub(r"^Перейти к товару\s+", "", name, flags=re.IGNORECASE)
+def normalize_name(value: Any) -> str:
+    return re.sub(r"^Перейти к товару\s+", "", clean_text(value), flags=re.IGNORECASE)
 
 
-def normalize_url(url):
-    """Приводит URL к единому виду для защиты от повторного обхода."""
+def normalize_url(url: str) -> str:
     parsed = urlsplit(url)
     query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
     return urlunsplit(parsed._replace(query=query, fragment="")).rstrip("/")
 
 
-def page_number(url):
-    """Возвращает номер страницы из page или PAGEN_1; каталог без параметра считается первой."""
-    query = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
-    for key, value in query.items():
-        if key.lower() in {"page", "pagen_1"} and value.isdigit():
-            return int(value)
-    return 1
+class IleDeBeauteScraper:
+    """Collect canonical raw records from the catalogue and product pages."""
 
+    def __init__(
+        self,
+        start_url: str = DEFAULT_CATALOG_URL,
+        max_pages: int | None = None,
+        *,
+        request_timeout: float = REQUEST_TIMEOUT_SECONDS,
+        delay: float = 0.0,
+        session=None,
+    ) -> None:
+        if not start_url:
+            raise ValueError("start_url must not be empty")
+        if max_pages is not None and max_pages < 1:
+            raise ValueError("max_pages must be greater than zero")
+        if delay < 0:
+            raise ValueError("delay must not be negative")
+        self.start_url = start_url
+        self.max_pages = max_pages
+        self.request_timeout = request_timeout
+        self.delay = delay
+        self.session = session or create_session()
+        self.products: list[dict[str, Any]] = []
 
-def create_session():
-    """Создает одну HTTP-сессию с браузерными заголовками для всех запросов."""
-    session = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "desktop": True}
-    )
-    session.headers.update(HEADERS)
-    return session
+    def fetch_page(self, url: str) -> str:
+        try:
+            response = self.session.get(url, timeout=self.request_timeout)
+            response.raise_for_status()
+            return response.text
+        except Exception as error:
+            LOGGER.exception("Request failed: %s", url)
+            raise ScraperError(f"Unable to fetch Il de Beaute page: {url}") from error
 
+    @staticmethod
+    def _price_value(element) -> str:
+        if not element:
+            return ""
+        value = element.get("content") or element.get_text(" ", strip=True)
+        return re.sub(r"\D", "", clean_text(value))
 
-def fetch_html(session, url):
-    """Загружает страницу и останавливает скрапер при HTTP-ошибке."""
-    response = session.get(url, timeout=30)
-    response.raise_for_status()
-    return response.text
+    def _product_links(self, html: str) -> list[dict[str, str]]:
+        soup = BeautifulSoup(html, "html.parser")
+        products = []
+        seen = set()
+        for link in soup.select("a[href*='/product/']"):
+            url = normalize_url(urljoin(BASE_URL, link.get("href", "")))
+            name = normalize_name(
+                link.get("aria-label") or link.get("title") or link.get_text(" ", strip=True)
+            )
+            if not name:
+                image = link.select_one("img[alt]")
+                name = normalize_name(image.get("alt") if image else "")
+            if name and url and url not in seen:
+                seen.add(url)
+                products.append({"name": name, "url": url})
+        return products
 
-
-def parse_catalog_page(html):
-    """Извлекает уникальные названия и URL товаров с одной страницы каталога."""
-    soup = BeautifulSoup(html, "html.parser")
-    products = []
-    seen_urls = set()
-
-    for link in soup.select("a[href*='/product/']"):
-        href = link.get("href")
-        if not href:
-            continue
-
-        product_url = urljoin(BASE_URL, href)
-        normalized_product_url = normalize_url(product_url)
-        if normalized_product_url in seen_urls:
-            continue
-
-        name = normalize_name(
-            link.get("aria-label")
-            or link.get("title")
-            or link.get_text(" ", strip=True)
+    def _product_record(self, product: dict[str, str]) -> dict[str, Any] | None:
+        soup = BeautifulSoup(self.fetch_page(product["url"]), "html.parser")
+        title = soup.select_one("h1")
+        area = soup
+        if title:
+            for parent in title.parents:
+                if parent.name in {"body", "html"}:
+                    break
+                text = clean_text(parent.get_text(" ", strip=True))
+                if parent.select_one('[itemprop="price"]') or re.search(r"\d[\d\s]*¤", text):
+                    area = parent
+                    break
+        current = self._price_value(area.select_one('[itemprop="price"]'))
+        old = ""
+        for selector in ("[class*='old-price']", "[class*='oldPrice']", "del", "s"):
+            value = self._price_value(area.select_one(selector))
+            if value and value != current:
+                old = value
+                break
+        if not current:
+            return None
+        return raw_product(
+            shop="iledebeaute",
+            url=product["url"],
+            name=normalize_name(title.get_text(" ", strip=True)) if title else product["name"],
+            current_price=current,
+            old_price=old,
         )
-        if not name:
-            image = link.select_one("img[alt]")
-            name = normalize_name(image.get("alt") if image else "")
-        if not name:
-            continue
 
-        seen_urls.add(normalized_product_url)
-        products.append({"name": name, "url": product_url})
-
-    return products
-
-
-def extract_product_area(soup):
-    """Выбирает ближайший к h1 блок, где находятся цена и данные товара."""
-    title = soup.select_one("h1")
-    if not title:
-        return soup
-
-    for parent in title.parents:
-        if parent.name in {"body", "html"}:
-            break
-        text = clean_text(parent.get_text(" ", strip=True))
-        if parent.select_one('[itemprop="price"]') or re.search(r"\d[\d\s]*¤", text):
-            return parent
-
-    return title.parent or soup
-
-
-def parse_price_value(element):
-    """Читает цену из content или видимого текста и возвращает целое число рублей."""
-    if not element:
-        return None
-
-    value = element.get("content") or element.get_text(" ", strip=True)
-    digits = re.sub(r"\D", "", clean_text(value))
-    return int(digits) if digits else None
-
-
-def extract_current_price(area):
-    """Извлекает текущую цену из семантического атрибута itemprop=price."""
-    return parse_price_value(area.select_one('[itemprop="price"]'))
-
-
-def extract_old_price(area, current_price):
-    """Извлекает старую цену из перечеркнутого или старого ценового блока."""
-    selectors = [
-        ".css-1nvlaef",
-        "[class*='old-price']",
-        "[class*='oldPrice']",
-        "del",
-        "s",
-    ]
-    for selector in selectors:
-        value = parse_price_value(area.select_one(selector))
-        if value is not None and value != current_price:
-            return value
-    return None
-
-
-def parse_product_page(session, product):
-    """Открывает товар и возвращает только name, url, current_price и old_price."""
-    soup = BeautifulSoup(fetch_html(session, product["url"]), "html.parser")
-    area = extract_product_area(soup)
-    title = soup.select_one("h1")
-    current_price = extract_current_price(area)
-    old_price = extract_old_price(area, current_price)
-
-    return {
-        "name": normalize_name(title.get_text(" ", strip=True)) if title else product["name"],
-        "url": product["url"],
-        "current_price": current_price,
-        "old_price": old_price,
-    }
-
-
-def find_next_page(soup, current_url, visited_pages):
-    """Находит следующую непосещенную страницу по кнопке или номеру пагинации."""
-    current_number = page_number(current_url)
-    candidates = []
-    for link in soup.select("a[href]"):
-        href = link.get("href")
-        if not href:
-            continue
-        text = clean_text(link.get_text(" ", strip=True)).lower()
-        if not (
-            "показать еще" in text
-            or "показать ещё" in text
-            or "pagen_1" in href.lower()
-            or "page=" in href.lower()
-        ):
-            continue
-
-        candidate = urljoin(current_url, href)
-        normalized = normalize_url(candidate)
-        if (
-            page_number(candidate) > current_number
-            and normalized not in visited_pages
-        ):
-            candidates.append((page_number(candidate), candidate))
-
-    if candidates:
-        return min(candidates, key=lambda item: item[0])[1]
-    return None
-
-
-def save_jsonl(products, path=OUTPUT_PATH):
-    """Сохраняет каждую готовую запись отдельной JSON-строкой."""
-    with open(path, "w", encoding="utf-8") as file:
-        for product in products:
-            file.write(json.dumps(product, ensure_ascii=False) + "\n")
-
-
-def scrape_catalog():
-    """Обходит каталог и товары без дублей, затем сохраняет JSONL."""
-    session = create_session()
-    current_url = CATALOG_URL
-    visited_pages = set()
-    seen_products = set()
-    products = []
-
-    while current_url:
-        normalized_page = normalize_url(current_url)
-        if normalized_page in visited_pages:
-            break
-        visited_pages.add(normalized_page)
-
-        print(f"Каталог {len(visited_pages)}: {current_url}")
-        soup = BeautifulSoup(fetch_html(session, current_url), "html.parser")
-        catalog_products = parse_catalog_page(str(soup))
-        print(f"Найдено ссылок: {len(catalog_products)}")
-
-        for index, product in enumerate(catalog_products, start=1):
-            product_key = normalize_url(product["url"])
-            if product_key in seen_products:
+    @staticmethod
+    def _next_page(soup: BeautifulSoup, current_url: str, visited: set[str]) -> str | None:
+        current_query = dict(parse_qsl(urlsplit(current_url).query, keep_blank_values=True))
+        current_number = int(next((v for k, v in current_query.items() if k.lower() in {"page", "pagen_1"} and v.isdigit()), "1"))
+        candidates = []
+        for link in soup.select("a[href]"):
+            href = link.get("href", "")
+            text = clean_text(link.get_text(" ", strip=True)).lower()
+            if not ("показать" in text or "pagen_1" in href.lower() or "page=" in href.lower()):
                 continue
-            seen_products.add(product_key)
-            print(f"Товар {index}/{len(catalog_products)}: {product['name']}")
-            products.append(parse_product_page(session, product))
+            candidate = urljoin(current_url, href)
+            query = dict(parse_qsl(urlsplit(candidate).query, keep_blank_values=True))
+            number = int(next((v for k, v in query.items() if k.lower() in {"page", "pagen_1"} and v.isdigit()), "1"))
+            normalized = normalize_url(candidate)
+            if number > current_number and normalized not in visited:
+                candidates.append((number, candidate))
+        return min(candidates)[1] if candidates else None
 
-        current_url = find_next_page(soup, current_url, visited_pages)
+    def run(self) -> list[dict[str, Any]]:
+        self.products = []
+        current_url = self.start_url
+        visited_pages: set[str] = set()
+        seen_products: set[str] = set()
+        while current_url and (self.max_pages is None or len(visited_pages) < self.max_pages):
+            normalized_page = normalize_url(current_url)
+            if normalized_page in visited_pages:
+                break
+            visited_pages.add(normalized_page)
+            try:
+                html = self.fetch_page(current_url)
+            except ScraperError as error:
+                LOGGER.warning("Stopping pagination: %s", error)
+                break
+            soup = BeautifulSoup(html, "html.parser")
+            for product in self._product_links(html):
+                product_key = normalize_url(product["url"])
+                if product_key in seen_products:
+                    continue
+                seen_products.add(product_key)
+                try:
+                    record = self._product_record(product)
+                except ScraperError as error:
+                    LOGGER.warning("Skipping product %s: %s", product["url"], error)
+                    continue
+                if record:
+                    self.products.append(record)
+            current_url = self._next_page(soup, current_url, visited_pages)
+        return self.products
 
-    save_jsonl(products)
-    print(f"Готово: {len(products)} товаров, страниц: {len(visited_pages)}")
-    return products
+    def save_to_jsonl(self, filename: str = "products.jsonl") -> None:
+        save_jsonl(self.products, filename)
 
 
 if __name__ == "__main__":
-    scrape_catalog()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    scraper = IleDeBeauteScraper(max_pages=int(os.getenv("MAX_PAGES", "0")) or None)
+    products = scraper.run()
+    scraper.save_to_jsonl("products.jsonl")
+    if os.getenv("PUBLISH_TO_KAFKA", "false").lower() == "true":
+        publish_products("iledebeaute", products)

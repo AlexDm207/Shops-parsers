@@ -1,3 +1,6 @@
 requests>=2.32.0
 beautifulsoup4>=4.12.3
 cloudscraper>=1.2.71
+playwright>=1.45.0
+prometheus-client>=0.20.0
+confluent-kafka>=2.5.0
