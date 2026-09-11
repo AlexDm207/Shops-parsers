@@ -14,15 +14,26 @@ from bs4 import BeautifulSoup
 from requests import Response, Session
 from requests.exceptions import RequestException, Timeout
 
-from scraper_runtime import (
-    REQUEST_ERRORS,
-    REQUEST_TIMEOUT_SECONDS,
-    ScraperError,
-    create_session,
-    publish_products,
-    raw_product,
-    save_jsonl,
-)
+try:
+    from .scraper_runtime import (
+        REQUEST_ERRORS,
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
+except ImportError:
+    from scraper_runtime import (
+        REQUEST_ERRORS,
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
 
 LOGGER = logging.getLogger(__name__)
 SHOP = "magnit"
@@ -168,7 +179,7 @@ class MagnitScraper:
             name = self._clean(link.get_text(" ", strip=True))
         else:
             name = self._clean(name_node.get("content") or name_node.get_text(" ", strip=True))
-        if not name or not current:
+        if not name or not current or (not old and not discount):
             return None
         return raw_product(shop=SHOP, url=product_url, name=name, current_price=current, old_price=old, discount=discount)
 

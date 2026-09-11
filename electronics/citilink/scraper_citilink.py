@@ -14,15 +14,26 @@ from bs4 import BeautifulSoup
 from requests import Response, Session
 from requests.exceptions import RequestException, Timeout
 
-from scraper_runtime import (  # noqa: E402
-    REQUEST_ERRORS,
-    REQUEST_TIMEOUT_SECONDS,
-    ScraperError,
-    create_session,
-    publish_products,
-    raw_product,
-    save_jsonl,
-)
+try:
+    from .scraper_runtime import (
+        REQUEST_ERRORS,
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
+except ImportError:
+    from scraper_runtime import (
+        REQUEST_ERRORS,
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
 
 
 LOGGER = logging.getLogger(__name__)
@@ -175,14 +186,15 @@ class CitilinkScraper:
                 discount = f"-{percent}%"
         product_url = self._absolute(url, page_url)
         current_price = self._price(current)
-        if not name or not product_url or current_price is None:
+        old_price = self._price(old)
+        if not name or not product_url or current_price is None or (old_price is None and not discount):
             return None
         return raw_product(
             shop=SHOP,
             url=product_url,
             name=self._clean(name),
             current_price=current_price,
-            old_price=self._price(old),
+            old_price=old_price,
             discount=self._clean(discount),
         )
 

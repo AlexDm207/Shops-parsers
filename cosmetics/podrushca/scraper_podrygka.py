@@ -11,25 +11,34 @@ import json
 import logging
 import os
 import random
-import sys
 import time
-from pathlib import Path
 from typing import Any, Iterator, Mapping
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
-COMMON_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(COMMON_ROOT))
-from scraper_common import (  # noqa: E402
-    REQUEST_TIMEOUT_SECONDS,
-    ScraperError,
-    create_session,
-    publish_products,
-    raw_product,
-    save_jsonl,
-    sleep_between_requests,
-)
+try:
+    from ..scraper_common import (
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        has_promotion,
+        publish_products,
+        raw_product,
+        save_jsonl,
+        sleep_between_requests,
+    )
+except ImportError:
+    from scraper_common import (
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        has_promotion,
+        publish_products,
+        raw_product,
+        save_jsonl,
+        sleep_between_requests,
+    )
 
 try:
     import cloudscraper
@@ -130,7 +139,7 @@ class PodrygkaScraper:
         if isinstance(offers, Mapping):
             current = current if current is not None else self._first_value(offers, "price", "lowPrice")
             old = old if old is not None else self._first_value(offers, "highPrice", "oldPrice")
-        if not name or not url or current is None:
+        if not name or not url or current is None or not has_promotion(current, old, discount):
             return None
         product_url = self._product_url(url, page_url)
         if not product_url:
@@ -261,10 +270,13 @@ class PodrygkaScraper:
             page += 1
         return self.products
 
-    def save_to_jsonl(self, filename: str = "products.jsonl") -> None:
+    def save_to_jsonl(self, filename: str = "products.jsonl") -> int:
         """Write collected raw records as UTF-8 JSON Lines."""
+        if not self.products:
+            self.run()
         LOGGER.info("Saving %s products to %s", len(self.products), filename)
         save_jsonl(self.products, filename)
+        return len(self.products)
 
 
 if __name__ == "__main__":

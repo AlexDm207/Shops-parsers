@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 
 import requests
 from confluent_kafka import Producer
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, REGISTRY
 
 try:
     import cloudscraper
@@ -30,19 +31,35 @@ REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 RAW_PRODUCTS_TOPIC = os.getenv("RAW_PRODUCTS_TOPIC", "raw-products")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
-REQUEST_ERRORS = Counter(
-    "scraper_request_errors_total", "Scraper request errors", ["shop"]
-)
-PRODUCTS_PUBLISHED = Counter(
-    "scraper_products_published_total", "Products published", ["shop"]
-)
-LAST_SUCCESSFUL_RUN = Gauge(
-    "scraper_last_successful_run_timestamp", "Last successful scraper run", ["shop"]
-)
+def _counter(name: str, description: str, labels: list[str]) -> Counter:
+    existing = REGISTRY._names_to_collectors.get(name)
+    return existing if existing is not None else Counter(name, description, labels)
+
+
+def _gauge(name: str, description: str, labels: list[str]) -> Gauge:
+    existing = REGISTRY._names_to_collectors.get(name)
+    return existing if existing is not None else Gauge(name, description, labels)
+
+
+REQUEST_ERRORS = _counter("scraper_request_errors_total", "Scraper request errors", ["shop"])
+PRODUCTS_PUBLISHED = _counter("scraper_products_published_total", "Products published", ["shop"])
+LAST_SUCCESSFUL_RUN = _gauge("scraper_last_successful_run_timestamp", "Last successful scraper run", ["shop"])
 
 
 class ScraperError(RuntimeError):
     """A recoverable error in a store scraper."""
+
+
+def has_promotion(current: Any, old: Any = None, discount: Any = None) -> bool:
+    """Return true when raw price fields contain promotion evidence."""
+    if discount not in (None, "", False, "0", "0%"):
+        return True
+    values = []
+    for value in (current, old):
+        match = re.search(r"\d[\d\s.,]*", str(value or ""))
+        if match:
+            values.append(float(match.group(0).replace(" ", "").replace(",", ".")))
+    return len(values) == 2 and values[1] > values[0]
 
 
 def create_session() -> requests.Session:

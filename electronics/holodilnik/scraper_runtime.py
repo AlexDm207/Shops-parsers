@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 import requests
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, REGISTRY
 
 try:
     from confluent_kafka import Producer
@@ -32,9 +32,19 @@ REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 RAW_PRODUCTS_TOPIC = os.getenv("RAW_PRODUCTS_TOPIC", "raw-products")
 
-REQUEST_ERRORS = Counter("scraper_request_errors_total", "Scraper request errors", ["shop"])
-PRODUCTS_PUBLISHED = Counter("scraper_products_published_total", "Products published", ["shop"])
-LAST_SUCCESSFUL_RUN = Gauge("scraper_last_successful_run_timestamp", "Last successful scraper run", ["shop"])
+def _counter(name: str, description: str, labels: list[str]) -> Counter:
+    existing = REGISTRY._names_to_collectors.get(name)
+    return existing if existing is not None else Counter(name, description, labels)
+
+
+def _gauge(name: str, description: str, labels: list[str]) -> Gauge:
+    existing = REGISTRY._names_to_collectors.get(name)
+    return existing if existing is not None else Gauge(name, description, labels)
+
+
+REQUEST_ERRORS = _counter("scraper_request_errors_total", "Scraper request errors", ["shop"])
+PRODUCTS_PUBLISHED = _counter("scraper_products_published_total", "Products published", ["shop"])
+LAST_SUCCESSFUL_RUN = _gauge("scraper_last_successful_run_timestamp", "Last successful scraper run", ["shop"])
 
 
 class ScraperError(RuntimeError):

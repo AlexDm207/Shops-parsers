@@ -14,15 +14,26 @@ from bs4 import BeautifulSoup
 from requests import Response, Session
 from requests.exceptions import RequestException, Timeout
 
-from scraper_runtime import (
-    REQUEST_ERRORS,
-    REQUEST_TIMEOUT_SECONDS,
-    ScraperError,
-    create_session,
-    publish_products,
-    raw_product,
-    save_jsonl,
-)
+try:
+    from .scraper_runtime import (
+        REQUEST_ERRORS,
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
+except ImportError:
+    from scraper_runtime import (
+        REQUEST_ERRORS,
+        REQUEST_TIMEOUT_SECONDS,
+        ScraperError,
+        create_session,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
 
 LOGGER = logging.getLogger(__name__)
 SHOP = "pyaterochka"

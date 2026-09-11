@@ -9,24 +9,31 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
-from pathlib import Path
 from typing import Any, Iterator, List, Mapping, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 from requests.exceptions import RequestException
 
-COMMON_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(COMMON_ROOT))
-from scraper_common import (  # noqa: E402
-    REQUEST_TIMEOUT_SECONDS,
-    create_session,
-    publish_products,
-    raw_product,
-    save_jsonl,
-)
+try:
+    from ..scraper_common import (
+        REQUEST_TIMEOUT_SECONDS,
+        create_session,
+        has_promotion,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
+except ImportError:
+    from scraper_common import (
+        REQUEST_TIMEOUT_SECONDS,
+        create_session,
+        has_promotion,
+        publish_products,
+        raw_product,
+        save_jsonl,
+    )
 
 # use cloudscraper when available, otherwise use requests.
 try:
@@ -177,7 +184,7 @@ class RiveGaucheScraper:
         current = self._first_value(item, "price_current", "currentPrice", "salePrice", "price", "finalPrice")
         old = self._first_value(item, "price_old", "oldPrice", "regularPrice", "basePrice", "old_price")
         discount = self._first_value(item, "discount_label", "discount", "discountLabel", "badge", "saleLabel")
-        if not title or not url or current is None:
+        if not title or not url or current is None or not has_promotion(current, old, discount):
             return None
         product_url = self._product_url(url)
         if not product_url:
@@ -239,7 +246,9 @@ class RiveGaucheScraper:
                 "old": old_node.get_text(" ", strip=True) if old_node else None,
                 "discount": discount_node.get_text(" ", strip=True) if discount_node else None,
             }
-            if not product_data["url"]:
+            if not product_data["url"] or not has_promotion(
+                product_data["current"], product_data["old"], product_data["discount"]
+            ):
                 continue
             product = raw_product(
                 shop="rivegosh",
@@ -291,7 +300,8 @@ class RiveGaucheScraper:
                 break
             all_products.extend(products)
             page += 1
-        return self._unique(all_products)
+        self.products = self._unique(all_products)
+        return self.products
 
     def fetch_all_products(self) -> List[dict]:
         # keep the familiar method name for the external pipeline.
@@ -299,9 +309,10 @@ class RiveGaucheScraper:
 
     def save_to_jsonl(self, filename: str) -> int:
         # write each raw object as one JSONL line.
-        products = self.run()
-        save_jsonl(products, filename)
-        return len(products)
+        if not getattr(self, "products", None):
+            self.run()
+        save_jsonl(self.products, filename)
+        return len(self.products)
 
 
 if __name__ == "__main__":
